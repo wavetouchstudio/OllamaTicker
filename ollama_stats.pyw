@@ -616,6 +616,7 @@ class OllamaTicker(ctk.CTk):
         m.add_cascade(label="   Opacity ▶", menu=om)
 
         m.add_separator()
+        m.add_command(label="   List Models", command=self._show_models)
         m.add_command(label="   Reset Position", command=self._reset_position)
         m.add_command(label="   Quit", command=self._on_close)
 
@@ -632,6 +633,114 @@ class OllamaTicker(ctk.CTk):
     def _toggle_snap(self):
         self.cfg["snap"] = not self.cfg.get("snap", True)
         save_cfg(self.cfg)
+
+    def _show_models(self):
+        t = self.t
+        try:
+            r = requests.get(f"{SERVER_URL}/api/tags", timeout=5)
+            r.raise_for_status()
+            models = sorted(r.json().get("models", []),
+                            key=lambda m: m.get("name", ""))
+        except Exception:
+            models = []
+
+        popup = tk.Toplevel(self)
+        popup.overrideredirect(True)
+        popup.configure(bg=t["bg"])
+        popup.wm_attributes("-topmost", True)
+
+        # Position to the right of the main window, or below if no room
+        wx, wy  = self.winfo_x(), self.winfo_y()
+        ww      = self.winfo_width()
+        sw      = self.winfo_screenwidth()
+        pw      = 480
+        px      = wx + ww + 8 if wx + ww + 8 + pw < sw else wx - pw - 8
+        popup.geometry(f"{pw}x320+{px}+{wy}")
+
+        # ── Title bar ──────────────────────────────────────────────────────
+        bar = tk.Frame(popup, bg=t["bar"], height=30)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+
+        tk.Label(bar, text="⬡  INSTALLED MODELS",
+                 bg=t["bar"], fg=t["accent"],
+                 font=self._fonts["title"], anchor="w", padx=10
+                 ).pack(side="left", fill="y")
+
+        close = tk.Label(bar, text=" × ", bg=t["bar"], fg=t["sub"],
+                          font=self._fonts["close"], cursor="hand2")
+        close.pack(side="right", padx=2)
+        close.bind("<Button-1>", lambda e: popup.destroy())
+        close.bind("<Enter>",    lambda e: close.configure(fg=t["err"]))
+        close.bind("<Leave>",    lambda e: close.configure(fg=t["sub"]))
+
+        # Drag
+        _d = [0, 0]
+        def _ds(e): _d[0] = e.x_root - popup.winfo_x(); _d[1] = e.y_root - popup.winfo_y()
+        def _dm(e): popup.geometry(f"+{e.x_root-_d[0]}+{e.y_root-_d[1]}")
+        bar.bind("<Button-1>",  _ds)
+        bar.bind("<B1-Motion>", _dm)
+
+        # ── Content ────────────────────────────────────────────────────────
+        body = tk.Frame(popup, bg=t["bg"], padx=10, pady=8)
+        body.pack(fill="both", expand=True)
+
+        family = self.cfg.get("font_family", "Consolas")
+
+        if models:
+            col = max((len(m.get("name", "")) for m in models), default=10)
+            col = max(col, 4) + 2
+            lines  = f"{'NAME':<{col}} {'PARAMS':<8} {'QUANT':<9} {'SIZE':>7}\n"
+            lines += "─" * (col + 26) + "\n"
+            for m in models:
+                name   = m.get("name", "")
+                size   = m.get("size", 0)
+                d      = m.get("details", {})
+                params = d.get("parameter_size", "—")
+                quant  = d.get("quantization_level", "—")
+                gb     = f"{size / 1_073_741_824:.1f} GB"
+                lines += f"{name:<{col}} {params:<8} {quant:<9} {gb:>7}\n"
+        else:
+            lines = "No models found — is Ollama running?"
+
+        txt = tk.Text(body, bg=t["card"], fg=t["text"],
+                      font=(family, 9), relief="flat", wrap="none",
+                      bd=0, padx=8, pady=6, cursor="arrow",
+                      selectbackground=t["accent"],
+                      selectforeground=t["bg"])
+        txt.pack(fill="both", expand=True)
+
+        sb = tk.Scrollbar(body, orient="horizontal", command=txt.xview,
+                          bg=t["card"], troughcolor=t["bg"],
+                          highlightthickness=0, bd=0)
+        txt.configure(xscrollcommand=sb.set)
+        sb.pack(fill="x")
+
+        txt.insert("1.0", lines)
+        txt.configure(state="disabled")
+
+        # ── Footer ─────────────────────────────────────────────────────────
+        footer = tk.Frame(popup, bg=t["card"], height=26)
+        footer.pack(fill="x", side="bottom")
+        footer.pack_propagate(False)
+
+        n = len(models)
+        tk.Label(footer, text=f"{n} model{'s' if n != 1 else ''}",
+                 bg=t["card"], fg=t["sub"],
+                 font=(family, 8)).pack(side="left", padx=10)
+
+        def _copy():
+            popup.clipboard_clear()
+            popup.clipboard_append(txt.get("1.0", "end-1c"))
+            copy_lbl.configure(fg=t["ok"])
+            popup.after(500, lambda: copy_lbl.configure(fg=t["sub"]))
+
+        copy_lbl = tk.Label(footer, text="Copy All", bg=t["card"],
+                             fg=t["sub"], font=(family, 8), cursor="hand2")
+        copy_lbl.pack(side="right", padx=10)
+        copy_lbl.bind("<Button-1>", lambda e: _copy())
+        copy_lbl.bind("<Enter>",    lambda e: copy_lbl.configure(fg=t["accent"]))
+        copy_lbl.bind("<Leave>",    lambda e: copy_lbl.configure(fg=t["sub"]))
 
     def _reset_position(self):
         self._full_h = BASE_H
