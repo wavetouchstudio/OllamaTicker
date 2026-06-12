@@ -11,21 +11,25 @@ import customtkinter as ctk
 import requests
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-SERVER_URL  = sys.argv[1].rstrip("/") if len(sys.argv) > 1 else "http://localhost:11434"
 CONFIG_PATH = Path(sys.argv[0]).parent / "config.json"
 POLL_SECS   = 2
-BASE_W      = 340
+PANEL_W     = 300
+PANEL_MIN_W = 200
 BASE_H      = 260
-MIN_W       = 220
 MIN_H       = 160
 SNAP_PX     = 18
 HISTORY     = 80
 
+DEFAULT_SERVERS = [
+    {"name": "Ollama", "type": "ollama", "url": "http://localhost:11434"},
+]
+
 DEFAULT_CFG = {
     "theme": "Midnight", "always_on_top": True,
-    "x": None, "y": None, "w": BASE_W, "h": BASE_H,
+    "x": None, "y": None, "w": None, "h": BASE_H,
     "opacity": 1.0, "mini": False, "snap": True,
     "font_scale": 1.0, "font_family": "Consolas",
+    "servers": DEFAULT_SERVERS,
 }
 
 FONT_FAMILIES = [
@@ -66,9 +70,19 @@ THEMES = {
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def load_cfg():
     try:
-        return {**DEFAULT_CFG, **json.loads(CONFIG_PATH.read_text())}
+        cfg = {**DEFAULT_CFG, **json.loads(CONFIG_PATH.read_text())}
     except Exception:
-        return DEFAULT_CFG.copy()
+        cfg = DEFAULT_CFG.copy()
+    if not cfg.get("servers"):
+        cfg["servers"] = [s.copy() for s in DEFAULT_SERVERS]
+    # argv override: first ollama server's URL (for run_local.bat / run_remote.bat)
+    if len(sys.argv) > 1:
+        url = sys.argv[1].rstrip("/")
+        for s in cfg["servers"]:
+            if s.get("type", "ollama") == "ollama":
+                s["url"] = url
+                break
+    return cfg
 
 def save_cfg(cfg):
     try:
@@ -90,6 +104,17 @@ def fmt_countdown(iso):
         return f"{h}h {m}m" if h else f"{m}m {s:02d}s"
     except Exception:
         return "—"
+
+def fmt_val(key, val):
+    if not val:
+        return "—"
+    if key == "vram":
+        return fmt_gb(val)
+    if key == "context":
+        return f"{val:,} tokens"
+    if key == "expires":
+        return fmt_countdown(val)
+    return str(val)
 
 def lighten(hex_color, amt=45):
     h = hex_color.lstrip("#")
@@ -129,6 +154,126 @@ class Tooltip:
             self._tip.destroy()
             self._tip = None
 
+# ── Backend ───────────────────────────────────────────────────────────────────
+class Backend:
+    """Polls one server (Ollama or an OpenAI-compatible API) for stats."""
+
+    EMPTY_STATE = {"status": "connecting", "model": None, "vram": None,
+                    "context": None, "expires": None, "details": None}
+
+    def __init__(self, cfg):
+        self.name    = cfg.get("name", "Server")
+        self.url     = cfg.get("url", "").rstrip("/")
+        self.kind    = cfg.get("type", "ollama")
+        self.api_key = cfg.get("api_key")
+        self.headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        self.lock    = threading.Lock()
+        self.state   = self.EMPTY_STATE.copy()
+        self.seen    = None
+        self.hist    = deque(maxlen=HISTORY)
+        self.full_model = ""
+
+    def start(self):
+        threading.Thread(target=self._poll_loop, daemon=True).start()
+
+    def _set_state(self, **kwargs):
+        with self.lock:
+            self.state = {**self.EMPTY_STATE, **kwargs}
+
+    def _poll_loop(self):
+        while True:
+            try:
+                if self.kind == "openai":
+                    self._poll_openai()
+                else:
+                    self._poll_ollama()
+            except requests.ConnectionError:
+                self._set_state(status="offline")
+                self.seen = None
+            except Exception:
+                pass
+            time.sleep(POLL_SECS)
+
+    def _poll_ollama(self):
+        r = requests.get(f"{self.url}/api/ps", timeout=3)
+        r.raise_for_status()
+        models = r.json().get("models", [])
+
+        if not models:
+            self._set_state(status="idle")
+            self.seen = None
+            return
+
+        m       = models[0]
+        name    = m.get("name", "unknown")
+        vram    = m.get("size_vram") or m.get("size", 0)
+        expires = m.get("expires_at", "")
+        details = m.get("details", {})
+
+        if name != self.seen:
+            ctx = self._fetch_context(name)
+            self.seen = name
+        else:
+            with self.lock:
+                ctx = self.state.get("context")
+
+        self._set_state(status="active", model=name, vram=vram,
+                         context=ctx, expires=expires, details=details)
+
+    def _fetch_context(self, name):
+        try:
+            r = requests.post(f"{self.url}/api/show",
+                              json={"name": name}, timeout=5)
+            r.raise_for_status()
+            for k, v in r.json().get("model_info", {}).items():
+                if "context_length" in k:
+                    return int(v)
+        except Exception:
+            pass
+        return None
+
+    def _poll_openai(self):
+        r = requests.get(f"{self.url}/v1/models", headers=self.headers, timeout=3)
+        r.raise_for_status()
+        models = r.json().get("data", [])
+
+        if not models:
+            self._set_state(status="idle")
+            return
+
+        m = models[0]
+        self._set_state(status="active", model=m.get("id", "unknown"),
+                         context=m.get("context_length"))
+
+    def list_models(self):
+        """Returns (header_columns, rows) for the 'List Models' popup."""
+        if self.kind == "openai":
+            try:
+                r = requests.get(f"{self.url}/v1/models", headers=self.headers, timeout=5)
+                r.raise_for_status()
+                models = sorted(r.json().get("data", []), key=lambda m: m.get("id", ""))
+            except Exception:
+                return []
+            return [{"name": m.get("id", ""),
+                     "params": "—", "quant": "—",
+                     "size": f"{(m.get('context_length') or 0):,} ctx"}
+                    for m in models]
+        else:
+            try:
+                r = requests.get(f"{self.url}/api/tags", timeout=5)
+                r.raise_for_status()
+                models = sorted(r.json().get("models", []), key=lambda m: m.get("name", ""))
+            except Exception:
+                return []
+            out = []
+            for m in models:
+                d = m.get("details", {})
+                out.append({"name": m.get("name", ""),
+                            "params": d.get("parameter_size", "—"),
+                            "quant": d.get("quantization_level", "—"),
+                            "size": f"{m.get('size', 0) / 1_073_741_824:.1f} GB"})
+            return out
+
 # ── App ───────────────────────────────────────────────────────────────────────
 class OllamaTicker(ctk.CTk):
 
@@ -138,27 +283,31 @@ class OllamaTicker(ctk.CTk):
 
         self.cfg    = load_cfg()
         self.t      = THEMES[self.cfg.get("theme", "Midnight")]
-        self._lock  = threading.Lock()
-        self._state = {"status": "connecting", "model": None,
-                       "vram": None, "context": None,
-                       "expires": None, "details": None}
-        self._seen      = None
-        self._hist      = deque(maxlen=HISTORY)
+        self.backends = [Backend(s) for s in self.cfg["servers"]]
+        n           = len(self.backends)
+        self._base_w = PANEL_W * n
+        self._min_w  = PANEL_MIN_W * n
+
         self._mini      = self.cfg.get("mini", False)
         self._full_h    = self.cfg.get("h", BASE_H)
-        self._full_model = ""
         self._resize_job = None
         self._dx = self._dy = 0
         self._rw = self._rh = self._rsx = self._rsy = 0
+        self._panels = []
+        self._mini_widgets = []
 
         self.title("OllamaTicker")
         self.overrideredirect(True)
 
-        w = self.cfg.get("w", BASE_W)
+        w = self.cfg.get("w") or self._base_w
         h = 30 if self._mini else self._full_h
         self.geometry(f"{w}x{h}")
         x, y = self.cfg.get("x"), self.cfg.get("y")
         if x is not None and y is not None:
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            if x < 0 or y < 0 or x + w > sw or y + h > sh:
+                x = min(max(0, x), sw - w)
+                y = min(max(0, y), sh - h)
             self.geometry(f"+{x}+{y}")
         self.wm_attributes("-topmost", self.cfg.get("always_on_top", True))
         self.wm_attributes("-alpha",   self.cfg.get("opacity", 1.0))
@@ -167,7 +316,8 @@ class OllamaTicker(ctk.CTk):
         self._setup_fonts(w, h)
         self._build_ui()
 
-        threading.Thread(target=self._poll_loop, daemon=True).start()
+        for b in self.backends:
+            b.start()
         self.after(500, self._refresh_ui)
 
     # ── Fonts (dynamic) ───────────────────────────────────────────────────────
@@ -175,7 +325,8 @@ class OllamaTicker(ctk.CTk):
         if self._mini:
             win_scale = 1.0
         else:
-            win_scale = max(0.65, min(2.0, min(w / BASE_W, h / BASE_H)))
+            n = len(self.backends)
+            win_scale = max(0.65, min(2.0, min((w / n) / PANEL_W, h / BASE_H)))
 
         scale  = win_scale * self.cfg.get("font_scale", 1.0)
         family = self.cfg.get("font_family", "Consolas")
@@ -203,6 +354,8 @@ class OllamaTicker(ctk.CTk):
     def _build_ui(self):
         for w in self.winfo_children():
             w.destroy()
+        self._panels = []
+        self._mini_widgets = []
 
         t = self.t
         self.configure(fg_color=t["bg"])
@@ -232,42 +385,56 @@ class OllamaTicker(ctk.CTk):
             widget.bind("<Button-3>",        self._show_menu)
 
         if self._mini:
-            # Mini: just a slim status strip inside the bar
-            with self._lock:
-                s = self._state.copy()
-            mini_dot = tk.Label(bar, text="●", bg=t["bar"],
-                                 fg=self._dot_color(s["status"]),
-                                 font=self._fonts["status"])
-            mini_dot.pack(side="left")
-            if s.get("model"):
-                tk.Label(bar, text=s["model"][:22],
-                         bg=t["bar"], fg=t["sub"],
+            # Mini: a slim status strip per server inside the bar
+            for idx, b in enumerate(self.backends):
+                with b.lock:
+                    s = b.state.copy()
+                dot = tk.Label(bar, text="●", bg=t["bar"],
+                                fg=self._dot_color(s["status"]),
+                                font=self._fonts["status"])
+                dot.pack(side="left", padx=(10 if idx > 0 else 0, 0))
+                lbl_text = (s["model"] or b.name)[:16]
+                tk.Label(bar, text=lbl_text, bg=t["bar"], fg=t["sub"],
                          font=self._fonts["status"]).pack(side="left", padx=4)
+                self._mini_widgets.append({"dot": dot})
             return
 
-        # ─ Body ───────────────────────────────────────────────────────────────
-        body = tk.Frame(self, bg=t["bg"], padx=14, pady=8)
+        # ─ Panels ─────────────────────────────────────────────────────────────
+        panels_frame = tk.Frame(self, bg=t["bg"])
+        panels_frame.pack(fill="both", expand=True)
+
+        for idx, b in enumerate(self.backends):
+            if idx > 0:
+                tk.Frame(panels_frame, bg=t["card"], width=1).pack(side="left", fill="y")
+            self._build_panel(panels_frame, idx, b, is_last=(idx == len(self.backends) - 1))
+
+        self.bind_all("<Button-3>", self._show_menu)
+
+    def _build_panel(self, parent, idx, b, is_last):
+        t = self.t
+        panel = tk.Frame(parent, bg=t["bg"])
+        panel.pack(side="left", fill="both", expand=True)
+
+        body = tk.Frame(panel, bg=t["bg"], padx=14, pady=8)
         body.pack(fill="both", expand=True)
 
         # Model name — click to copy, hover to see full name
-        self._name_lbl = tk.Label(body, text="Connecting…",
-                                   bg=t["bg"], fg=t["accent"],
-                                   font=self._fonts["model"],
-                                   anchor="w", cursor="hand2")
-        self._name_lbl.pack(fill="x")
-        self._name_lbl.bind("<Button-1>", self._copy_model_name)
-        self._name_lbl.bind(
-            "<Enter>", lambda e: self._name_lbl.configure(fg=lighten(self.t["accent"])))
-        self._name_lbl.bind(
-            "<Leave>", lambda e: self._name_lbl.configure(fg=self.t["accent"]))
-        Tooltip(self._name_lbl,
-                lambda: self._full_model if len(self._full_model) > 28 else "",
+        name_lbl = tk.Label(body, text="Connecting…",
+                             bg=t["bg"], fg=t["accent"],
+                             font=self._fonts["model"],
+                             anchor="w", cursor="hand2")
+        name_lbl.pack(fill="x")
+        name_lbl.bind("<Button-1>", lambda e, i=idx: self._copy_model_name(i))
+        name_lbl.bind("<Enter>", lambda e, w=name_lbl: w.configure(fg=lighten(self.t["accent"])))
+        name_lbl.bind("<Leave>", lambda e, w=name_lbl: w.configure(fg=self.t["accent"]))
+        Tooltip(name_lbl,
+                lambda i=idx: self.backends[i].full_model if len(self.backends[i].full_model) > 28 else "",
                 bg=t["card"], fg=t["text"])
 
-        # Detail line  (family · params · quant)
-        self._detail_lbl = tk.Label(body, text="", bg=t["bg"], fg=t["sub"],
-                                     font=self._fonts["label"], anchor="w")
-        self._detail_lbl.pack(fill="x")
+        # Detail line (family · params · quant)
+        detail_lbl = tk.Label(body, text="", bg=t["bg"], fg=t["sub"],
+                               font=self._fonts["label"], anchor="w")
+        detail_lbl.pack(fill="x")
 
         # Separator
         tk.Frame(body, bg=t["card"], height=1).pack(fill="x", pady=(7, 6))
@@ -276,106 +443,58 @@ class OllamaTicker(ctk.CTk):
         grid = tk.Frame(body, bg=t["bg"])
         grid.pack(fill="x")
 
-        self._vals = {}
-        for i, (label, key) in enumerate([("VRAM",    "vram"),
-                                           ("Context", "context"),
-                                           ("Expires", "expires")]):
+        fields = [("VRAM", "vram"), ("Context", "context"), ("Expires", "expires")] \
+            if b.kind != "openai" else [("Context", "context")]
+
+        vals = {}
+        for i, (label, key) in enumerate(fields):
             tk.Label(grid, text=label, bg=t["bg"], fg=t["sub"],
                      font=self._fonts["label"], width=9, anchor="w"
                      ).grid(row=i, column=0, sticky="w", pady=2)
             v = tk.Label(grid, text="—", bg=t["bg"], fg=t["text"],
                          font=self._fonts["value"], anchor="w")
             v.grid(row=i, column=1, sticky="w", padx=(6, 0), pady=2)
-            self._vals[key] = v
+            vals[key] = v
 
-        # Sparkline — expands to fill remaining body space
+        # Sparkline (VRAM history) — only meaningful for Ollama
         tk.Frame(body, bg=t["card"], height=1).pack(fill="x", pady=(7, 4))
-        self._spark = tk.Canvas(body, bg=t["bg"],
-                                 highlightthickness=0, bd=0)
-        self._spark.pack(fill="both", expand=True)
+        spark = None
+        if b.kind != "openai":
+            spark = tk.Canvas(body, bg=t["bg"], highlightthickness=0, bd=0)
+            spark.pack(fill="both", expand=True)
+        else:
+            tk.Frame(body, bg=t["bg"]).pack(fill="both", expand=True)
 
-        # ─ Status bar ─────────────────────────────────────────────────────────
-        sb = tk.Frame(self, bg=t["card"], height=22)
-        sb.pack(fill="x", side="bottom")
-        sb.pack_propagate(False)
+        # ─ Footer ─────────────────────────────────────────────────────────────
+        footer = tk.Frame(panel, bg=t["card"], height=22)
+        footer.pack(fill="x", side="bottom")
+        footer.pack_propagate(False)
 
-        self._dot = tk.Label(sb, text="●", bg=t["card"], fg=t["warn"],
-                              font=self._fonts["status"])
-        self._dot.pack(side="left", padx=(8, 2))
+        dot = tk.Label(footer, text="●", bg=t["card"], fg=t["warn"],
+                       font=self._fonts["status"])
+        dot.pack(side="left", padx=(8, 2))
 
-        self._status_lbl = tk.Label(sb, text="Connecting…", bg=t["card"],
-                                     fg=t["sub"], font=self._fonts["status"])
-        self._status_lbl.pack(side="left")
+        status_lbl = tk.Label(footer, text="Connecting…", bg=t["card"],
+                               fg=t["sub"], font=self._fonts["status"])
+        status_lbl.pack(side="left")
 
-        # Resize grip (bottom-right corner)
-        grip = tk.Label(sb, text="◢", bg=t["card"], fg=t["sub"],
-                         font=self._fonts["status"], cursor="size_nw_se")
-        grip.pack(side="right", padx=(0, 3))
-        grip.bind("<Button-1>",        self._resize_start)
-        grip.bind("<B1-Motion>",       self._resize_move)
-        grip.bind("<ButtonRelease-1>", self._resize_end)
+        if is_last:
+            grip = tk.Label(footer, text="◢", bg=t["card"], fg=t["sub"],
+                            font=self._fonts["status"], cursor="size_nw_se")
+            grip.pack(side="right", padx=(0, 3))
+            grip.bind("<Button-1>",        self._resize_start)
+            grip.bind("<B1-Motion>",       self._resize_move)
+            grip.bind("<ButtonRelease-1>", self._resize_end)
 
-        host = SERVER_URL.replace("http://", "").replace("https://", "")
-        tk.Label(sb, text=host, bg=t["card"], fg=t["sub"],
+        tk.Label(footer, text=b.name, bg=t["card"], fg=t["sub"],
                  font=self._fonts["status"]).pack(side="right", padx=4)
 
-        self.bind_all("<Button-3>", self._show_menu)
+        self._panels.append({"name_lbl": name_lbl, "detail_lbl": detail_lbl,
+                              "vals": vals, "spark": spark,
+                              "dot": dot, "status_lbl": status_lbl})
 
     # ── Polling ───────────────────────────────────────────────────────────────
-    def _poll_loop(self):
-        while True:
-            try:
-                r = requests.get(f"{SERVER_URL}/api/ps", timeout=3)
-                r.raise_for_status()
-                models = r.json().get("models", [])
-
-                if not models:
-                    with self._lock:
-                        self._state = {"status": "idle", "model": None,
-                                       "vram": None, "context": None,
-                                       "expires": None, "details": None}
-                    self._seen = None
-                else:
-                    m       = models[0]
-                    name    = m.get("name", "unknown")
-                    vram    = m.get("size_vram") or m.get("size", 0)
-                    expires = m.get("expires_at", "")
-                    details = m.get("details", {})
-
-                    if name != self._seen:
-                        ctx = self._fetch_context(name)
-                        self._seen = name
-                    else:
-                        with self._lock:
-                            ctx = self._state.get("context")
-
-                    with self._lock:
-                        self._state = {"status": "active", "model": name,
-                                       "vram": vram, "context": ctx,
-                                       "expires": expires, "details": details}
-
-            except requests.ConnectionError:
-                with self._lock:
-                    self._state = {"status": "offline", "model": None,
-                                   "vram": None, "context": None,
-                                   "expires": None, "details": None}
-                self._seen = None
-            except Exception:
-                pass
-
-            time.sleep(POLL_SECS)
-
-    def _fetch_context(self, name):
-        try:
-            r = requests.post(f"{SERVER_URL}/api/show",
-                              json={"name": name}, timeout=5)
-            r.raise_for_status()
-            for k, v in r.json().get("model_info", {}).items():
-                if "context_length" in k:
-                    return int(v)
-        except Exception:
-            pass
-        return None
+    # (handled by Backend instances)
 
     # ── UI Refresh ────────────────────────────────────────────────────────────
     def _dot_color(self, status):
@@ -384,79 +503,74 @@ class OllamaTicker(ctk.CTk):
                 "offline":self.t["err"]}.get(status, self.t["warn"])
 
     def _refresh_ui(self):
-        with self._lock:
-            s = self._state.copy()
-
         if self._mini:
             self.after(1000, self._refresh_ui)
             return
 
         t = self.t
+        for b, p in zip(self.backends, self._panels):
+            with b.lock:
+                s = b.state.copy()
 
-        if s["status"] == "offline":
-            self._name_lbl.configure(text="Ollama Offline", fg=t["err"])
-            self._detail_lbl.configure(text="")
-            for v in self._vals.values():
-                v.configure(text="—")
-            self._dot.configure(fg=t["err"])
-            self._status_lbl.configure(text="Offline")
-            self._full_model = ""
-            self._spark.delete("all")
+            if s["status"] == "offline":
+                p["name_lbl"].configure(text="Offline", fg=t["err"])
+                p["detail_lbl"].configure(text="")
+                for v in p["vals"].values():
+                    v.configure(text="—")
+                p["dot"].configure(fg=t["err"])
+                p["status_lbl"].configure(text="Offline")
+                b.full_model = ""
+                if p["spark"]:
+                    p["spark"].delete("all")
 
-        elif s["status"] == "idle":
-            self._name_lbl.configure(text="No model loaded", fg=t["sub"])
-            self._detail_lbl.configure(text="")
-            for v in self._vals.values():
-                v.configure(text="—")
-            self._dot.configure(fg=t["warn"])
-            self._status_lbl.configure(text="Idle")
-            self._full_model = ""
-            self._spark.delete("all")
+            elif s["status"] == "idle":
+                p["name_lbl"].configure(text="No model loaded", fg=t["sub"])
+                p["detail_lbl"].configure(text="")
+                for v in p["vals"].values():
+                    v.configure(text="—")
+                p["dot"].configure(fg=t["warn"])
+                p["status_lbl"].configure(text="Idle")
+                b.full_model = ""
+                if p["spark"]:
+                    p["spark"].delete("all")
 
-        elif s["status"] == "active":
-            name = s["model"] or "—"
-            self._full_model = name
-            disp = name if len(name) <= 28 else name[:25] + "…"
-            self._name_lbl.configure(text=disp, fg=t["accent"])
+            elif s["status"] == "active":
+                name = s["model"] or "—"
+                b.full_model = name
+                disp = name if len(name) <= 28 else name[:25] + "…"
+                p["name_lbl"].configure(text=disp, fg=t["accent"])
 
-            d = s["details"] or {}
-            parts = [x for x in [
-                (d.get("family") or "").capitalize(),
-                d.get("parameter_size", ""),
-                d.get("quantization_level", ""),
-            ] if x]
-            self._detail_lbl.configure(text=" · ".join(parts))
+                d = s["details"] or {}
+                parts = [x for x in [
+                    (d.get("family") or "").capitalize(),
+                    d.get("parameter_size", ""),
+                    d.get("quantization_level", ""),
+                ] if x]
+                p["detail_lbl"].configure(text=" · ".join(parts))
 
-            vram = s["vram"]
-            self._vals["vram"].configure(text=fmt_gb(vram) if vram else "—")
+                for key, v in p["vals"].items():
+                    v.configure(text=fmt_val(key, s.get(key)))
 
-            ctx = s["context"]
-            self._vals["context"].configure(
-                text=f"{ctx:,} tokens" if ctx else "—")
+                p["dot"].configure(fg=t["ok"])
+                p["status_lbl"].configure(text="Active")
 
-            self._vals["expires"].configure(
-                text=fmt_countdown(s["expires"]) if s["expires"] else "—")
+                if p["spark"]:
+                    if s["vram"]:
+                        b.hist.append(s["vram"] / 1_073_741_824)
+                    self._draw_sparkline(b, p["spark"])
 
-            self._dot.configure(fg=t["ok"])
-            self._status_lbl.configure(text="Active")
-
-            if vram:
-                self._hist.append(vram / 1_073_741_824)
-            self._draw_sparkline()
-
-        else:
-            self._dot.configure(fg=t["warn"])
-            self._status_lbl.configure(text="Connecting…")
+            else:
+                p["dot"].configure(fg=t["warn"])
+                p["status_lbl"].configure(text="Connecting…")
 
         self.after(500, self._refresh_ui)
 
     # ── Sparkline ─────────────────────────────────────────────────────────────
-    def _draw_sparkline(self):
-        c = self._spark
+    def _draw_sparkline(self, backend, c):
         c.delete("all")
         w = c.winfo_width()
         h = c.winfo_height()
-        readings = list(self._hist)
+        readings = list(backend.hist)
         if len(readings) < 2 or w < 4 or h < 4:
             return
 
@@ -520,7 +634,7 @@ class OllamaTicker(ctk.CTk):
         self._rsx, self._rsy = e.x_root, e.y_root
 
     def _resize_move(self, e):
-        nw = max(MIN_W, self._rw + (e.x_root - self._rsx))
+        nw = max(self._min_w, self._rw + (e.x_root - self._rsx))
         nh = max(MIN_H, self._rh + (e.y_root - self._rsy))
         self.geometry(f"{nw}x{nh}")
         # Debounced font scale update
@@ -636,13 +750,6 @@ class OllamaTicker(ctk.CTk):
 
     def _show_models(self):
         t = self.t
-        try:
-            r = requests.get(f"{SERVER_URL}/api/tags", timeout=5)
-            r.raise_for_status()
-            models = sorted(r.json().get("models", []),
-                            key=lambda m: m.get("name", ""))
-        except Exception:
-            models = []
 
         popup = tk.Toplevel(self)
         popup.overrideredirect(True)
@@ -687,21 +794,32 @@ class OllamaTicker(ctk.CTk):
 
         family = self.cfg.get("font_family", "Consolas")
 
-        if models:
-            col = max((len(m.get("name", "")) for m in models), default=10)
-            col = max(col, 4) + 2
-            lines  = f"{'NAME':<{col}} {'PARAMS':<8} {'QUANT':<9} {'SIZE':>7}\n"
-            lines += "─" * (col + 26) + "\n"
-            for m in models:
-                name   = m.get("name", "")
-                size   = m.get("size", 0)
-                d      = m.get("details", {})
-                params = d.get("parameter_size", "—")
-                quant  = d.get("quantization_level", "—")
-                gb     = f"{size / 1_073_741_824:.1f} GB"
-                lines += f"{name:<{col}} {params:<8} {quant:<9} {gb:>7}\n"
-        else:
-            lines = "No models found — is Ollama running?"
+        all_rows = []
+        for b in self.backends:
+            rows = b.list_models()
+            all_rows.append((b.name, rows))
+
+        col = 4
+        for _, rows in all_rows:
+            for r in rows:
+                col = max(col, len(r["name"]))
+        col += 2
+
+        lines = ""
+        total = 0
+        for name, rows in all_rows:
+            lines += f"── {name} " + "─" * max(0, col + 23 - len(name)) + "\n"
+            if rows:
+                lines += f"{'NAME':<{col}} {'PARAMS':<8} {'QUANT':<9} {'SIZE':>9}\n"
+                for r in rows:
+                    lines += f"{r['name']:<{col}} {r['params']:<8} {r['quant']:<9} {r['size']:>9}\n"
+                total += len(rows)
+            else:
+                lines += "  (no models found / unreachable)\n"
+            lines += "\n"
+
+        if not lines.strip():
+            lines = "No models found — is the server running?"
 
         txt = tk.Text(body, bg=t["card"], fg=t["text"],
                       font=(family, 9), relief="flat", wrap="none",
@@ -724,8 +842,7 @@ class OllamaTicker(ctk.CTk):
         footer.pack(fill="x", side="bottom")
         footer.pack_propagate(False)
 
-        n = len(models)
-        tk.Label(footer, text=f"{n} model{'s' if n != 1 else ''}",
+        tk.Label(footer, text=f"{total} model{'s' if total != 1 else ''}",
                  bg=t["card"], fg=t["sub"],
                  font=(family, 8)).pack(side="left", padx=10)
 
@@ -744,13 +861,13 @@ class OllamaTicker(ctk.CTk):
 
     def _reset_position(self):
         self._full_h = BASE_H
-        self.cfg["w"], self.cfg["h"] = BASE_W, BASE_H
+        self.cfg["w"], self.cfg["h"] = self._base_w, BASE_H
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
-        x  = (sw - BASE_W) // 2
+        x  = (sw - self._base_w) // 2
         y  = (sh - BASE_H) // 2
-        self.geometry(f"{BASE_W}x{BASE_H}+{x}+{y}")
-        self._setup_fonts(BASE_W, BASE_H)
+        self.geometry(f"{self._base_w}x{BASE_H}+{x}+{y}")
+        self._setup_fonts(self._base_w, BASE_H)
         save_cfg(self.cfg)
 
     def _set_font_family(self, family):
@@ -788,14 +905,16 @@ class OllamaTicker(ctk.CTk):
         self.apply_theme(random.choice(choices))
 
     # ── Copy model name ───────────────────────────────────────────────────────
-    def _copy_model_name(self, e=None):
-        if not self._full_model:
+    def _copy_model_name(self, idx):
+        b = self.backends[idx]
+        if not b.full_model:
             return
         self.clipboard_clear()
-        self.clipboard_append(self._full_model)
+        self.clipboard_append(b.full_model)
         # Flash green as confirmation
-        self._name_lbl.configure(fg=self.t["ok"])
-        self.after(400, lambda: self._name_lbl.configure(fg=self.t["accent"]))
+        name_lbl = self._panels[idx]["name_lbl"]
+        name_lbl.configure(fg=self.t["ok"])
+        self.after(400, lambda: name_lbl.configure(fg=self.t["accent"]))
 
     # ── Close ─────────────────────────────────────────────────────────────────
     def _on_close(self):
