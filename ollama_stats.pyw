@@ -797,6 +797,9 @@ class OllamaTicker(ctk.CTk):
         all_rows = []
         for b in self.backends:
             rows = b.list_models()
+            rows = [r for r in rows
+                    if "cloud" not in r["name"].lower()
+                    and "embed" not in r["name"].lower()]
             all_rows.append((b.name, rows))
 
         col = 4
@@ -821,18 +824,28 @@ class OllamaTicker(ctk.CTk):
         if not lines.strip():
             lines = "No models found — is the server running?"
 
-        txt = tk.Text(body, bg=t["card"], fg=t["text"],
+        text_row = tk.Frame(body, bg=t["bg"])
+        text_row.pack(fill="both", expand=True)
+
+        txt = tk.Text(text_row, bg=t["card"], fg=t["text"],
                       font=(family, 9), relief="flat", wrap="none",
                       bd=0, padx=8, pady=6, cursor="arrow",
                       selectbackground=t["accent"],
-                      selectforeground=t["bg"])
-        txt.pack(fill="both", expand=True)
+                      selectforeground=t["bg"],
+                      width=1, height=1)
+        txt.pack(side="left", fill="both", expand=True)
 
-        sb = tk.Scrollbar(body, orient="horizontal", command=txt.xview,
+        vsb = tk.Scrollbar(text_row, orient="vertical", command=txt.yview,
+                           bg=t["card"], troughcolor=t["bg"],
+                           highlightthickness=0, bd=0)
+        txt.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+
+        hsb = tk.Scrollbar(body, orient="horizontal", command=txt.xview,
                           bg=t["card"], troughcolor=t["bg"],
                           highlightthickness=0, bd=0)
-        txt.configure(xscrollcommand=sb.set)
-        sb.pack(fill="x")
+        txt.configure(xscrollcommand=hsb.set)
+        hsb.pack(fill="x")
 
         txt.insert("1.0", lines)
         txt.configure(state="disabled")
@@ -845,6 +858,21 @@ class OllamaTicker(ctk.CTk):
         tk.Label(footer, text=f"{total} model{'s' if total != 1 else ''}",
                  bg=t["card"], fg=t["sub"],
                  font=(family, 8)).pack(side="left", padx=10)
+
+        grip = tk.Label(footer, text="◢", bg=t["card"], fg=t["sub"],
+                        font=(family, 9), cursor="size_nw_se")
+        grip.pack(side="right", padx=(0, 6))
+
+        _rs = [0, 0, 0, 0]
+        def _popup_resize_start(e):
+            _rs[0], _rs[1] = popup.winfo_width(), popup.winfo_height()
+            _rs[2], _rs[3] = e.x_root, e.y_root
+        def _popup_resize_move(e):
+            nw = max(360, _rs[0] + (e.x_root - _rs[2]))
+            nh = max(180, _rs[1] + (e.y_root - _rs[3]))
+            popup.geometry(f"{nw}x{nh}")
+        grip.bind("<Button-1>",  _popup_resize_start)
+        grip.bind("<B1-Motion>", _popup_resize_move)
 
         def _copy():
             popup.clipboard_clear()
