@@ -1,4 +1,4 @@
 @echo off
 cd /d "%~dp0"
-pip install -r requirements.txt --quiet
-start "" pythonw ollama_stats.pyw http://localhost:11434
+py -3 -m pip install -r requirements.txt --quiet
+start "" pyw -3 ollama_stats.pyw http://localhost:11434
